@@ -99,42 +99,33 @@ def get_clientes():
             "email": c["email"]
         })
     return jsonify(clientes), 200
-
-# --- Crear una venta (modificado para guardar detalles del producto) ---
-@app.route('/api/ventas', methods=['POST', 'OPTIONS'])
+# --- Crear una venta ---
+@app.route('/api/ventas', methods=['POST'])
 @token_required
-def create_venta(payload):
-    if request.method == 'OPTIONS':
-        return '', 200
+def create_venta():
+    token = request.headers.get('Authorization').replace("Bearer ", "")
+    payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
+    id_vendedor = str(payload['id'])  # ✅ aseguramos string
 
-    id_vendedor = str(payload['id'])
     data = request.get_json()
-
     if not data.get('id_cliente') or not data.get('items'):
         return jsonify({"success": False, "message": "Datos incompletos"}), 400
 
-    items_con_detalle = []
-    for item in data['items']:
-        prod = mongo.db.clothes.find_one({"_id": ObjectId(item['product_id'])})
-        if not prod:
-            return jsonify({"success": False, "message": f"Producto {item['product_id']} no encontrado"}), 404
-        items_con_detalle.append({
-            "product_id": str(prod['_id']),
-            "descripcion": prod.get('name',''),
-            "cantidad": item['quantity'],
-            "price": float(item.get('price', prod.get('sale_price',0)))
-        })
-
     venta_doc = {
         "id_cliente": ObjectId(data['id_cliente']),
-        "id_vendedor": id_vendedor,
-        "items": items_con_detalle,
-        "total": sum([p['cantidad']*p['price'] for p in items_con_detalle]),
+        "id_vendedor": id_vendedor,  # ✅ guardamos como string
+        "items": data['items'],
+        "total": data.get('total', 0),
         "created_at": datetime.datetime.utcnow()
     }
 
     result = ventas.insert_one(venta_doc)
-    return jsonify({"success": True, "message": "Venta creada correctamente", "venta_id": str(result.inserted_id)}), 201
+
+    return jsonify({
+        "success": True,
+        "message": "Venta creada correctamente",
+        "venta_id": str(result.inserted_id)
+    }), 201
 
 
 # --- Obtener ventas ---
