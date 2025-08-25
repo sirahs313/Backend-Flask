@@ -10,7 +10,7 @@ from bson import ObjectId
 
 # Crear la app
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # Configuración MongoDB y JWT
 app.config['MONGO_URI'] = "mongodb+srv://ericksuacos30:313420313@clustereyhs.rik7vbx.mongodb.net/tienda?retryWrites=true&w=majority"
@@ -100,62 +100,78 @@ def get_clientes():
         })
     return jsonify(clientes), 200
 
-# --- Crear una venta ---
-@app.route('/api/ventas', methods=['POST'])
+# --- Crear una venta (modificado para guardar detalles del producto) ---
+@app.route('/api/ventas', methods=['POST', 'OPTIONS'])
 @token_required
-def create_venta():
-    token = request.headers.get('Authorization').replace("Bearer ", "")
-    payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
-    id_vendedor = payload['id']
+def create_venta(payload):
+    if request.method == 'OPTIONS':
+        return '', 200
 
+    id_vendedor = str(payload['id'])
     data = request.get_json()
+
     if not data.get('id_cliente') or not data.get('items'):
         return jsonify({"success": False, "message": "Datos incompletos"}), 400
+
+    items_con_detalle = []
+    for item in data['items']:
+        prod = mongo.db.clothes.find_one({"_id": ObjectId(item['product_id'])})
+        if not prod:
+            return jsonify({"success": False, "message": f"Producto {item['product_id']} no encontrado"}), 404
+        items_con_detalle.append({
+            "product_id": str(prod['_id']),
+            "descripcion": prod.get('name',''),
+            "cantidad": item['quantity'],
+            "price": float(item.get('price', prod.get('sale_price',0)))
+        })
 
     venta_doc = {
         "id_cliente": ObjectId(data['id_cliente']),
         "id_vendedor": id_vendedor,
-        "items": data['items'],  # [{"product_id":..., "quantity":..., "price":...}]
-        "total": data.get('total', 0),
+        "items": items_con_detalle,
+        "total": sum([p['cantidad']*p['price'] for p in items_con_detalle]),
         "created_at": datetime.datetime.utcnow()
     }
 
     result = ventas.insert_one(venta_doc)
+    return jsonify({"success": True, "message": "Venta creada correctamente", "venta_id": str(result.inserted_id)}), 201
 
-    return jsonify({
-        "success": True,
-        "message": "Venta creada correctamente",
-        "venta_id": str(result.inserted_id)
-    }), 201
 
-# --- Obtener ventas de un vendedor ---
+# --- Obtener ventas ---
 @app.route('/api/ventas', methods=['GET'])
 @token_required
-def get_ventas_vendedor():
+def get_ventas():
     token = request.headers.get('Authorization').replace("Bearer ", "")
     payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
-    id_vendedor = payload['id']
+    id_vendedor = str(payload['id'])
+    role = payload['role']
 
-    ventas_cursor = ventas.find({"id_vendedor": id_vendedor})
+    # Si es admin, trae todas las ventas, si no, solo las del vendedor
+    query = {} if role == 'admin' else {"id_vendedor": id_vendedor}
+    ventas_cursor = ventas.find(query)
+
     ventas_list = []
     for v in ventas_cursor:
         cliente = users.find_one({"_id": v.get('id_cliente')})
+        vendedor = users.find_one({"_id": ObjectId(v.get('id_vendedor'))}) if v.get('id_vendedor') else None
         ventas_list.append({
             "_id": str(v["_id"]),
             "id_cliente": {"name": cliente["name"]} if cliente else None,
+            "id_vendedor": {"name": vendedor["name"]} if vendedor else None,
             "productos": [
                 {
-                    "product_id": p.get("product_id"),
+                    "id_producto": p.get("product_id"),
                     "descripcion": p.get("descripcion", ""),
                     "cantidad": p.get("quantity", 0),
                     "price": float(p.get("price", 0))
                 } for p in v.get("items", [])
             ],
             "total": float(v.get("total", 0)),
-            # ⚡ Convertimos created_at a string ISO para que React pueda parsearlo
             "fecha": v.get("created_at").isoformat() if v.get("created_at") else None
         })
     return jsonify(ventas_list), 200
+
+ 
 
 
 # --- Obtener compras del cliente ---
