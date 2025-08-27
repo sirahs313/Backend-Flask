@@ -7,6 +7,7 @@ import jwt
 import datetime
 from functools import wraps
 from bson import ObjectId
+import pymysql
 
 # Crear la app
 app = Flask(__name__)
@@ -19,6 +20,29 @@ app.config['SECRET_KEY'] = 'tu_secreto_para_jwt'
 mongo = PyMongo(app)
 users = mongo.db.users  # Colección de usuarios
 ventas = mongo.db.ventas  # Colección de ventas
+
+# --- Configuración MySQL ---
+mysql_conn = pymysql.connect(
+    host='127.0.0.1',
+     port=3308,
+    user='root',
+    password='',
+    database='ropa',  # Cambia esto por tu base
+    cursorclass=pymysql.cursors.DictCursor,
+    autocommit=True
+)
+
+def get_mysql_product(product_id):
+    with mysql_conn.cursor() as cursor:
+        cursor.execute("SELECT * FROM clothes WHERE id = %s", (product_id,))
+        return cursor.fetchone()
+
+def update_mysql_stock(product_id, cantidad_vendida):
+    with mysql_conn.cursor() as cursor:
+        cursor.execute(
+            "UPDATE clothes SET stock = stock - %s WHERE id = %s",
+            (cantidad_vendida, product_id)
+        )
 
 # --- Decorador para verificar token ---
 def token_required(f):
@@ -99,6 +123,8 @@ def get_clientes():
             "email": c["email"]
         })
     return jsonify(clientes), 200
+
+# --- Crear una venta ---
 # --- Crear una venta ---
 @app.route('/api/ventas', methods=['POST'])
 @token_required
@@ -111,9 +137,36 @@ def create_venta():
     if not data.get('id_cliente') or not data.get('items'):
         return jsonify({"success": False, "message": "Datos incompletos"}), 400
 
+    # --- Validar stock en MySQL antes de insertar la venta ---
+    for item in data['items']:
+        prod = get_mysql_product(item['product_id'])
+        
+        if not prod:
+            return jsonify({
+                "success": False,
+                "message": f"El producto con ID {item['product_id']} no existe."
+            }), 400
+
+        if prod['stock'] == 0:
+            return jsonify({
+                "success": False,
+                "message": f"Lo sentimos, el producto '{prod['name']}' está agotado."
+            }), 400
+
+        if prod['stock'] < item['quantity']:
+            return jsonify({
+                "success": False,
+                "message": f"Solo quedan {prod['stock']} unidades de '{prod['name']}'. Ajusta la cantidad."
+            }), 400
+
+    # --- Reducir stock en MySQL ---
+    for item in data['items']:
+        update_mysql_stock(item['product_id'], item['quantity'])
+
+    # --- Guardar venta en MongoDB ---
     venta_doc = {
         "id_cliente": ObjectId(data['id_cliente']),
-        "id_vendedor": id_vendedor,  # ✅ guardamos como string
+        "id_vendedor": id_vendedor,
         "items": data['items'],
         "total": data.get('total', 0),
         "created_at": datetime.datetime.utcnow()
@@ -127,7 +180,6 @@ def create_venta():
         "venta_id": str(result.inserted_id)
     }), 201
 
-
 # --- Obtener ventas ---
 @app.route('/api/ventas', methods=['GET'])
 @token_required
@@ -137,7 +189,6 @@ def get_ventas():
     id_vendedor = str(payload['id'])
     role = payload['role']
 
-    # Si es admin, trae todas las ventas, si no, solo las del vendedor
     query = {} if role == 'admin' else {"id_vendedor": id_vendedor}
     ventas_cursor = ventas.find(query)
 
@@ -162,16 +213,13 @@ def get_ventas():
         })
     return jsonify(ventas_list), 200
 
- 
-
-
 # --- Obtener compras del cliente ---
 @app.route('/api/ventas/mis-compras', methods=['GET'])
 @token_required
 def get_mis_compras():
     token = request.headers.get('Authorization').replace("Bearer ", "")
     payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
-    id_cliente = payload['id']  # ⚡ el id del cliente logueado
+    id_cliente = payload['id']
 
     ventas_cursor = ventas.find({"id_cliente": ObjectId(id_cliente)})
     compras_list = []
@@ -200,7 +248,7 @@ def reporte_ventas():
     totalVentas = 0
     totalItems = 0
     ingresos = 0
-    ganancias = 0  # puedes calcular margen si tienes info de costo
+    ganancias = 0
 
     ventasPorDia = {}
     ventasPorUsuario = {}
@@ -211,7 +259,7 @@ def reporte_ventas():
         items = v.get('items', [])
         totalItems += sum([p.get('quantity', 0) for p in items])
         ingresos += sum([float(p.get('price', 0)) * p.get('quantity', 0) for p in items])
-        ganancias += sum([float(p.get('price', 0)) * p.get('quantity', 0) * 0.3 for p in items])  # ejemplo 30% ganancia
+        ganancias += sum([float(p.get('price', 0)) * p.get('quantity', 0) * 0.3 for p in items])
 
         fecha = v.get('created_at').strftime("%Y-%m-%d") if v.get('created_at') else "Sin Fecha"
         ventasPorDia.setdefault(fecha, {"ventas": 0, "items": 0, "ingresos": 0, "ganancias": 0})
@@ -249,7 +297,7 @@ def reporte_ventas():
         "productosMasVendidos": list(productosMasVendidos.values())
     })
 
-#obtener usuarios
+# Obtener todos los usuarios
 @app.route('/api/users', methods=['GET'])
 @token_required
 def get_users():
@@ -263,7 +311,8 @@ def get_users():
             "role": u.get("role", "cliente")
         })
     return jsonify(users_list), 200
-#Crear usuario
+
+# Crear usuario
 @app.route('/api/users', methods=['POST'])
 @token_required
 def create_user():
@@ -287,7 +336,8 @@ def create_user():
         "role": role
     })
     return jsonify({"success": True, "message": "Usuario creado"}), 201
-# actualizar usuario
+
+# Actualizar usuario
 @app.route('/api/users/<id>', methods=['PUT'])
 @token_required
 def update_user(id):
@@ -304,8 +354,7 @@ def update_user(id):
         return jsonify({"success": False, "message": "Usuario no modificado"}), 400
     return jsonify({"success": True, "message": "Usuario actualizado"}), 200
 
-
-#Eliminar usuario
+# Eliminar usuario
 @app.route('/api/users/<id>', methods=['DELETE'])
 @token_required
 def delete_user(id):
@@ -314,7 +363,7 @@ def delete_user(id):
         return jsonify({"success": False, "message": "Usuario no encontrado"}), 404
     return jsonify({"success": True, "message": "Usuario eliminado"}), 200
 
-#Ver ventas en dashboardadmin
+# Ver ventas en dashboard admin
 @app.route('/api/ventas/all', methods=['GET'])
 @token_required
 def get_all_ventas():
